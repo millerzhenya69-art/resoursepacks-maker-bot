@@ -1,0 +1,1 @@
+packs/base/*.zip !text !filter !merge !diff
