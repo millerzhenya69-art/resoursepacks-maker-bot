@@ -5,6 +5,8 @@ import asyncio
 import logging
 import os
 
+from download_packs import ensure_packs
+ensure_packs()
 from aiohttp import web
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
