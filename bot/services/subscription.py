@@ -1,0 +1,101 @@
+"""
+Проверка обязательной подписки на каналы и ботов.
+
+Логика:
+- Обычные каналы (@unkonyy, @AI_Elyon) — проверяем через get_chat_member
+- Бот (@Elyon_by_unkony_bot) — проверяем через БД (факт запуска /start у того бота)
+  Пометку ставит сам @Elyon_by_unkony_bot при старте, либо мы принимаем
+  на веру после нажатия кнопки (честная система — Telegram не даёт другого способа).
+"""
+from __future__ import annotations
+
+from aiogram import Bot
+from aiogram.exceptions import TelegramBadRequest
+
+from bot.config import REQUIRED_CHANNELS
+
+# username ботов (не каналов) — для них get_chat_member не работает
+BOT_USERNAMES: set[str] = {"Elyon_by_unkony_bot"}
+
+
+async def check_subscriptions(bot: Bot, user_id: int) -> list[dict]:
+    """
+    Проверяет подписку на все обязательные каналы/ботов.
+    Возвращает список тех, на кого пользователь НЕ подписан.
+    """
+    not_subscribed = []
+    for channel in REQUIRED_CHANNELS:
+        username = channel["username"]
+
+        if username in BOT_USERNAMES:
+            # Для ботов — проверяем флаг в нашей БД
+            started = await _check_bot_started(user_id, username)
+            if not started:
+                not_subscribed.append(channel)
+        else:
+            # Для каналов — стандартная проверка
+            subscribed = await _is_channel_member(bot, user_id, username)
+            if not subscribed:
+                not_subscribed.append(channel)
+
+    return not_subscribed
+
+
+async def mark_bot_started(user_id: int, bot_username: str) -> None:
+    """
+    Вызывается когда пользователь нажимает кнопку 'Я подписался'.
+    Помечаем что он запустил бота (доверяем на слово — иначе никак).
+    """
+    import aiosqlite
+    from bot.database.models import DB_PATH
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS bot_starts (
+                user_id      INTEGER NOT NULL,
+                bot_username TEXT    NOT NULL,
+                PRIMARY KEY (user_id, bot_username)
+            )
+        """)
+        await db.execute(
+            "INSERT OR IGNORE INTO bot_starts (user_id, bot_username) VALUES (?, ?)",
+            (user_id, bot_username)
+        )
+        await db.commit()
+
+
+async def mark_all_bots_started(user_id: int) -> None:
+    """Помечает все требуемые боты как запущенные для данного пользователя."""
+    for username in BOT_USERNAMES:
+        await mark_bot_started(user_id, username)
+
+
+async def _check_bot_started(user_id: int, bot_username: str) -> bool:
+    """Проверяет флаг в БД."""
+    import aiosqlite
+    from bot.database.models import DB_PATH
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            r = await db.execute(
+                "SELECT 1 FROM bot_starts WHERE user_id = ? AND bot_username = ?",
+                (user_id, bot_username)
+            )
+            return await r.fetchone() is not None
+    except Exception:
+        return False
+
+
+async def _is_channel_member(bot: Bot, user_id: int, channel_username: str) -> bool:
+    """Проверяет подписку на канал через Telegram API."""
+    try:
+        member = await bot.get_chat_member(
+            chat_id=f"@{channel_username}", user_id=user_id
+        )
+        return member.status not in ("left", "kicked", "banned")
+    except TelegramBadRequest as e:
+        err = str(e).lower()
+        # Канал не найден или бот не в канале — пропускаем проверку
+        if "chat not found" in err or "bot is not a member" in err or "user not found" in err:
+            return True
+        return False
+    except Exception:
+        return True

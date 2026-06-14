@@ -1,0 +1,28 @@
+# Секреты
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+
+# База данных
+*.db
+*.db-journal
+
+# Временные файлы сборки РП
+temp/
+
+# Готовые архивы (выходные файлы бота) — НЕ шаблоны и НЕ базовые паки
+# packs/base/*.zip и templates/**/*.zip — нужны боту, НЕ игнорируем
+
+# Системное
+.DS_Store
+Thumbs.db
+*.log
+
+# IDE
+.idea/
+.vscode/

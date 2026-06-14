@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: resourcepack-maker-bot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_ID
+        sync: false
+      - key: RENDER_URL
+        sync: false
+      - key: CRYPTOBOT_TOKEN
+        sync: false
+      - key: DONATEPAY_API_KEY
+        sync: false
+      - key: DONATEPAY_WEBHOOK_SECRET
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+    disk:
+      name: bot-data
+      mountPath: /opt/render/project/src
+      sizeGB: 1
