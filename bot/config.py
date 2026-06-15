@@ -20,10 +20,10 @@ REFERRAL_BONUS: int = 2            # бонус за каждого пригла
 
 # ── Тарифы (Stars → кол-во генераций) ─────────────────────
 TARIFFS = {
-    "start":   {"gens": 10,  "stars": 1,  "rub": 91},
+    "start":   {"gens": 10,  "stars": 75,  "rub": 91},
     "basic":   {"gens": 20,  "stars": 150, "rub": 182},
     "pro":     {"gens": 50,  "stars": 350, "rub": 420},
-    "ai_pack": {"gens": 5,   "stars": 0, "rub": 240},  # 5 ИИ-генераций
+    "ai_pack": {"gens": 5,   "stars": 1, "rub": 240},  # 5 ИИ-генераций
 }
 # Цена 1 генерации в звёздах (для кастомного кол-ва)
 STARS_PER_GEN: float = 7.5
