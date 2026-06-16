@@ -299,7 +299,7 @@ async def ai_build(call: CallbackQuery, state: FSMContext, bot: Bot):
                 f"ИИ-режим | Версия: {version}\n"
                 f"⚔️ {rp_params['weapons_label']} · 🛡️ {rp_params['armor_label']}\n"
                 + (f"💬 {(ai_params.get('explanation','') or '')[:150]}\n\n" if ai_params.get('explanation') else "\n")
-                + "Создано через @resourcepackmaker_bot"
+                + "Создано через @Resoursepack_maker_bot"
             ),
         )
         from bot.keyboards import publish_rp_keyboard
