@@ -477,7 +477,7 @@ async def rp_build(call: CallbackQuery, state: FSMContext, bot: Bot):
                 f"Тема: {theme_label} | Версия: {data.get('version')}\n"
                 f"⚔️ {data.get('weapons_label','—')} | 🛡️ {data.get('armor_label','—')}\n"
                 f"🌌 {data.get('sky_label','—')} | 📦 {data.get('gui_label','—')}\n\n"
-                f"Создано через @resourcepackmaker_bot"
+                f"Создано через @Resoursepack_maker_bot"
             ),
         )
         from bot.keyboards import publish_rp_keyboard
