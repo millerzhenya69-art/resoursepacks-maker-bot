@@ -435,7 +435,7 @@ async def _do_build(call: CallbackQuery, state: FSMContext, bot: Bot):
                 f"📁 <b>{rp_filename}</b>\n"
                 f"Кастомный РП | Версия: {version}\n"
                 f"Файлов: {total_files}\n\n"
-                "Создано через @resourcepackmaker_bot"
+                "Создано через @Resoursepack_maker_bot"
             ),
         )
         from bot.keyboards import publish_rp_keyboard
