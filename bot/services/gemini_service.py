@@ -2,10 +2,14 @@
 Сервис для работы с Gemini API.
 
 Иерархия моделей:
-  1. gemini-2.0-flash      (v1beta) — основная
-  2. gemini-2.0-flash-lite (v1beta) — fallback при 429
-  3. gemini-1.5-flash      (v1beta) — v1beta тоже поддерживает 1.5!
-  4. gemini-1.5-flash-8b   (v1beta) — самый дешёвый запасной
+  1. gemini-2.5-flash      (v1beta) — основная
+  2. gemini-2.0-flash      (v1beta) — fallback при 429
+  3. gemini-2.0-flash-lite (v1beta) — самый дешёвый запасной
+
+Исправления:
+  - maxOutputTokens увеличен до 4096 (был 2048 — JSON обрезался)
+  - Добавлена проверка на обрезанный JSON (finishReason != STOP)
+  - Более мягкий парсинг с попыткой восстановить обрезанный объект
 """
 from __future__ import annotations
 
@@ -21,13 +25,10 @@ from bot.config import GEMINI_API_KEY
 
 logger = logging.getLogger(__name__)
 
-# Все модели через v1beta — он поддерживает system_instruction и responseMimeType
-# v1 (stable) — более старый API, НЕ поддерживает эти поля
-# Порядок: лучшая сначала, fallback при 429
 GEMINI_MODELS = [
-    "gemini-2.5-flash",       # ✅ работает на Free tier
-    "gemini-2.0-flash",       # fallback
-    "gemini-2.0-flash-lite",  # fallback
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+    "gemini-2.0-flash-lite",
 ]
 
 GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
@@ -68,7 +69,7 @@ def _build_system_prompt() -> str:
 
 === ПРАВИЛА ===
 1. Отвечай ТОЛЬКО валидным JSON без Markdown-блоков и без пояснений вне JSON.
-2. Структура ответа СТРОГО:
+2. Структура ответа СТРОГО (все поля обязательны):
 {{
   "weapons":     "<key>",
   "armor":       "<key>",
@@ -80,13 +81,14 @@ def _build_system_prompt() -> str:
   "particles":   "<key>",
   "mainmenu":    "<key>",
   "color_hex":   "<hex без # или null>",
-  "explanation": "<2-3 предложения почему, на русском>",
-  "suggestions": "<1-2 идеи что ещё попробовать, на русском>"
+  "explanation": "<1 краткое предложение почему, на русском>",
+  "suggestions": "<1 короткая идея, на русском>"
 }}
-3. Используй ТОЛЬКО ключи из каталога.
-4. Понимай метафоры: "мрачный"→dark/pvp403, "огненный"→pvp394/pvp398, "ледяной"→crystal/pvp415.
-5. При уточнении — сохраняй остальные параметры, меняй только указанное.
-6. color_hex — тинт для оружия. null если не указано.
+3. Используй ТОЛЬКО ключи из каталога выше.
+4. explanation и suggestions — МАКСИМУМ 80 символов каждое. Краткость критична.
+5. Понимай метафоры: "мрачный"→dark/pvp403, "огненный"→pvp394/pvp398, "ледяной"→crystal/pvp415.
+6. При уточнении — сохраняй остальные параметры, меняй только указанное.
+7. color_hex — тинт для оружия без символа #. null если не указано.
 """
 
 
@@ -95,6 +97,24 @@ try:
 except Exception as e:
     logger.error(f"Failed to build system prompt: {e}")
     SYSTEM_PROMPT = "You are a Minecraft resource pack assistant. Respond with JSON only."
+
+
+def _try_fix_truncated_json(raw: str) -> Optional[dict]:
+    """
+    Пытается восстановить обрезанный JSON-объект.
+    Стратегия: берём все полностью завершённые строковые ключи.
+    """
+    result = {}
+    # Ищем все завершённые пары "key": "value"
+    pattern = re.compile(r'"(\w+)"\s*:\s*"([^"]*)"')
+    for match in pattern.finditer(raw):
+        key, val = match.group(1), match.group(2)
+        result[key] = val
+    # Ищем null-значения
+    null_pattern = re.compile(r'"(\w+)"\s*:\s*null')
+    for match in null_pattern.finditer(raw):
+        result[match.group(1)] = None
+    return result if result else None
 
 
 async def ask_gemini(
@@ -123,7 +143,7 @@ async def ask_gemini(
         "generationConfig": {
             "temperature": 0.7,
             "topP": 0.9,
-            "maxOutputTokens": 2048,
+            "maxOutputTokens": 4096,        # ← увеличено с 2048, чтобы JSON не обрезался
             "responseMimeType": "application/json",
         },
     }
@@ -138,7 +158,7 @@ async def ask_gemini(
             async with aiohttp.ClientSession() as session:
                 async with session.post(
                     url, json=payload,
-                    timeout=aiohttp.ClientTimeout(total=30),
+                    timeout=aiohttp.ClientTimeout(total=40),
                 ) as resp:
 
                     if resp.status == 429:
@@ -171,6 +191,19 @@ async def ask_gemini(
 
                     data = await resp.json()
 
+                    # Проверяем причину завершения — MAX_TOKENS означает обрезанный ответ
+                    try:
+                        finish_reason = (
+                            data["candidates"][0]
+                            .get("finishReason", "STOP")
+                        )
+                        if finish_reason == "MAX_TOKENS":
+                            logger.warning(
+                                f"Gemini {model} hit MAX_TOKENS — JSON may be truncated"
+                            )
+                    except (KeyError, IndexError):
+                        finish_reason = "STOP"
+
                     try:
                         raw = data["candidates"][0]["content"]["parts"][0]["text"]
                     except (KeyError, IndexError):
@@ -178,12 +211,12 @@ async def ask_gemini(
                         last_error = "Не удалось разобрать ответ ИИ"
                         continue
 
-                    # Надёжный парсинг: ищем первый { и последний }
+                    # Очищаем markdown-обёртки
                     clean = raw.strip()
-                    # Убираем markdown-блоки если есть
                     clean = re.sub(r"```(?:json)?", "", clean)
                     clean = re.sub(r"```", "", clean)
                     clean = clean.strip()
+
                     # Извлекаем JSON объект между первым { и последним }
                     start = clean.find("{")
                     end   = clean.rfind("}") + 1
@@ -193,16 +226,38 @@ async def ask_gemini(
                     try:
                         params = json.loads(clean)
                     except json.JSONDecodeError as je:
-                        logger.error(f"Gemini {model} invalid JSON: {clean[:300]} | err: {je}")
-                        last_error = "ИИ вернул невалидный JSON"
-                        continue
+                        logger.warning(
+                            f"Gemini {model} JSON parse failed ({je}), "
+                            f"trying truncation recovery..."
+                        )
+                        # Пытаемся восстановить обрезанный JSON
+                        params = _try_fix_truncated_json(clean)
+                        if not params:
+                            logger.error(f"Recovery failed. Raw: {clean[:300]}")
+                            last_error = "ИИ вернул невалидный JSON"
+                            continue
 
+                    # Проверяем наличие обязательных полей
                     required = {"weapons", "armor", "tools", "consumables",
                                 "sky", "gui", "sounds", "particles", "mainmenu"}
                     missing = required - set(params.keys())
                     if missing:
-                        last_error = f"Неполный ответ: нет {', '.join(missing)}"
-                        continue
+                        logger.warning(f"Gemini {model} missing fields: {missing}")
+                        # Подставляем дефолты для отсутствующих полей
+                        defaults = {
+                            "weapons":     "sword_pvp398",
+                            "armor":       "armor_pvp398",
+                            "tools":       "tools_pvp398",
+                            "consumables": "consumables_pvp398",
+                            "sky":         "sky_black",
+                            "gui":         "gui_pvp403",
+                            "sounds":      "sounds_pvp",
+                            "particles":   "particles_none",
+                            "mainmenu":    "menu_pvp403",
+                        }
+                        for field in missing:
+                            params[field] = defaults.get(field, "")
+                        logger.info(f"Applied defaults for missing fields: {missing}")
 
                     logger.info(f"Gemini OK via {model}")
                     return params, None

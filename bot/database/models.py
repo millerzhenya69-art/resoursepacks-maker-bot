@@ -34,6 +34,11 @@ class _DB:
     def __init__(self):
         self._conn = None
 
+    # Статический метод для проверки типа БД без создания соединения
+    @staticmethod
+    def _USE_PG_FLAG() -> bool:
+        return _USE_PG
+
     async def __aenter__(self):
         if _USE_PG:
             import asyncpg
@@ -80,6 +85,17 @@ class _DB:
             cur = await self._conn.execute(q, params)
             row = await cur.fetchone()
             return row[0] if row else None
+
+    async def fetchall(self, query: str, params: tuple = ()) -> list[dict]:
+        """Возвращает все строки как список dict — работает с PG и SQLite."""
+        q = self._sql(query)
+        if _USE_PG:
+            rows = await self._conn.fetch(q, *params)
+            return [dict(r) for r in rows]
+        else:
+            cur = await self._conn.execute(q, params)
+            rows = await cur.fetchall()
+            return [dict(r) for r in rows]
 
     async def execute(self, query: str, params: tuple = ()):
         q = self._sql(query)
