@@ -15,6 +15,7 @@ from aiogram.enums import ParseMode
 from bot.config import BOT_TOKEN, RENDER_URL
 from bot.database import init_db
 from bot.handlers import main_router
+from bot.middleware import BanMiddleware
 from bot.services.ping import self_ping_loop
 
 logging.basicConfig(
@@ -24,9 +25,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 os.makedirs(os.path.join(os.path.dirname(__file__), "temp"), exist_ok=True)
-
-# Глобальный bot для webhook
-_bot: Bot | None = None
 
 
 async def ping_handler(request: web.Request) -> web.Response:
@@ -60,6 +58,11 @@ async def main() -> None:
     )
 
     dp = Dispatcher()
+
+    # ── Middleware ─────────────────────────────────────────
+    # BanMiddleware подключается к Update (до роутеров)
+    dp.update.outer_middleware(BanMiddleware())
+
     dp.include_router(main_router)
 
     await start_web_server()

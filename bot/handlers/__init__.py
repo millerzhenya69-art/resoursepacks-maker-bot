@@ -17,5 +17,5 @@ main_router.include_routers(
     ai_rp_router,
     payment_router,
     upgrade_router,
-    admin_router,
+    admin_router,   # admin последним — его FSM не должен перехватывать чужие апдейты
 )
