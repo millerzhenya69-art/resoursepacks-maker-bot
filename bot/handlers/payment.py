@@ -330,12 +330,48 @@ async def pay_donate_custom(call: CallbackQuery, bot: Bot):
 @router.callback_query(F.data.startswith("ccheck_"))
 async def crypto_check_payment(call: CallbackQuery, bot: Bot):
     await call.answer("Проверяю...", show_alert=False)
-    parts = call.data.split("_", 4)
-    if len(parts) < 5:
+
+    # ИСПРАВЛЕНО: формат callback бывает двух видов —
+    #   ccheck_<invoice_id>_<tariff_key>_<user_id>                (обычный тариф)
+    #   ccheck_<invoice_id>_<user_id>_custom_<amount>             (кастомный пакет)
+    # Старый код использовал split("_", 4), что ломалось на тарифах
+    # с подчёркиванием в названии (например "ai_pack") — "pack" попадал
+    # в позицию user_id и int() кидал ValueError.
+    # Теперь разбираем по схеме: первая часть после ccheck_ — invoice_id
+    # (он не содержит "_", это просто числовой ID от CryptoBot),
+    # а остаток (rest) разбираем с учётом, что user_id — это ПОСЛЕДНИЙ
+    # числовой сегмент перед возможным "_custom_<amount>" хвостом.
+    body = call.data[len("ccheck_"):]
+    first_sep = body.find("_")
+    if first_sep < 0:
         return
-    invoice_id = parts[1]
-    tariff_key = parts[2]
-    user_id    = int(parts[3])
+    invoice_id = body[:first_sep]
+    rest = body[first_sep + 1:]  # "<tariff_key>_<user_id>" или "<user_id>_custom_<amount>"
+
+    custom_amount = None
+    tariff_key: str
+    user_id: int
+
+    if "_custom_" in rest:
+        # ccheck_<invoice_id>_<user_id>_custom_<amount>
+        uid_str, _, amount_str = rest.partition("_custom_")
+        if not uid_str.isdigit() or not amount_str.isdigit():
+            logger.warning(f"Malformed ccheck custom payload: {call.data}")
+            return
+        user_id = int(uid_str)
+        custom_amount = int(amount_str)
+        tariff_key = "custom"
+    else:
+        # ccheck_<invoice_id>_<tariff_key>_<user_id> — user_id это последний "_"-сегмент
+        last_sep = rest.rfind("_")
+        if last_sep < 0:
+            return
+        tariff_key = rest[:last_sep]
+        uid_str = rest[last_sep + 1:]
+        if not uid_str.isdigit():
+            logger.warning(f"Malformed ccheck payload: {call.data}")
+            return
+        user_id = int(uid_str)
 
     result = await _cryptobot_request("getInvoices", {"invoice_ids": invoice_id})
     if not result or not result["result"]["items"]:
@@ -345,15 +381,24 @@ async def crypto_check_payment(call: CallbackQuery, bot: Bot):
     status = result["result"]["items"][0].get("status")
 
     if status == "paid":
-        t  = _tariff_info(tariff_key)
-        ai = tariff_key == "ai_pack"
         async with _DB() as db:
             await db.execute(
                 "UPDATE payments SET status='paid' WHERE payload=? AND user_id=?",
                 (invoice_id, user_id)
             )
             await db.commit()
-        await _complete_payment(bot, user_id, t["gens"], ai, "₿ CryptoBot", tariff_key)
+
+        if custom_amount is not None:
+            await _complete_payment(bot, user_id, custom_amount, False, "₿ CryptoBot", "custom")
+        else:
+            t  = _tariff_info(tariff_key)
+            ai = tariff_key == "ai_pack"
+            if not t:
+                logger.error(f"Unknown tariff in ccheck: '{tariff_key}' (raw: {call.data})")
+                await call.answer("Ошибка: неизвестный тариф", show_alert=True)
+                return
+            await _complete_payment(bot, user_id, t["gens"], ai, "₿ CryptoBot", tariff_key)
+
         await edit_clean(call.message, "✅ Оплата подтверждена!", main_menu_keyboard())
     elif status == "active":
         await call.answer("⏳ Платёж ещё не поступил. Подожди немного.", show_alert=True)
