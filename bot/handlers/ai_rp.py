@@ -1,13 +1,19 @@
 """
 ИИ-режим создания ресурспака.
 
-Диалог:
-  1. Пользователь вводит свободный промпт
-  2. Gemini подбирает комбинацию шаблонов
-  3. Бот показывает preview выбора + кнопки:
-       ✅ Собрать РП  |  ✏️ Уточнить  |  🔄 Перегенерировать  |  ❌ Отмена
-  4. Пользователь может уточнить → история сохраняется → Gemini корректирует
-  5. После подтверждения — тот же RPBuilder что в шаблонном режиме
+ИСПРАВЛЕНО: тройная отправка файла.
+Старая логика: deduct_generation() и _log_ai_generation() вызывались ВНУТРИ
+цикла retry (for attempt in range(3)). Если send_document() проходил успешно,
+но deduct_generation() или _log_ai_generation() кидали исключение (например,
+гонка с другим апдейтом, временная проблема с БД) — это попадало в `except`,
+которое ошибочно трактовало это как неудачную отправку и повторяло
+send_document() заново. В результате файл уходил пользователю 2-3 раза,
+а на последней попытке что-то всё же падало и бот рапортовал "не удалось
+отправить файл" — хотя по факту уже отправил 2-3 копии.
+
+Исправление: send_document() теперь единственное, что выполняется внутри
+retry-цикла. deduct_generation() и логирование вызываются ОДИН раз после
+цикла, только если отправка точно прошла успешно.
 """
 from __future__ import annotations
 
@@ -37,7 +43,6 @@ logger = logging.getLogger(__name__)
 
 router = Router()
 
-# Для быстрого получения label по key
 _LABEL_MAP: dict[str, str] = {}
 for _lst in (WEAPONS, ARMOR, TOOLS, CONSUMABLES, SKIES, GUIS, SOUNDS, PARTICLES, MAINMENUS):
     for _item in _lst:
@@ -50,9 +55,9 @@ async def start_ai_dialog(call: CallbackQuery, state: FSMContext, bot: Bot, vers
     await state.set_state(AIRP.prompt)
     await state.update_data(
         version=version,
-        history=[],          # история диалога с Gemini
-        iteration=0,         # счётчик уточнений
-        last_ai_params=None, # последний ответ Gemini
+        history=[],
+        iteration=0,
+        last_ai_params=None,
     )
     await edit_clean(
         call.message,
@@ -83,7 +88,6 @@ async def receive_prompt(message: Message, state: FSMContext, bot: Bot):
     if len(prompt) > 1000:
         prompt = prompt[:1000]
 
-    # Показываем "думаю..."
     thinking_msg = await send_clean(
         bot, message.chat.id,
         "🤖 <b>Gemini подбирает комбинацию...</b>\n\n"
@@ -94,7 +98,6 @@ async def receive_prompt(message: Message, state: FSMContext, bot: Bot):
     history: list = data.get("history", [])
     iteration: int = data.get("iteration", 0)
 
-    # Запрашиваем Gemini
     ai_params, error = await ask_gemini(prompt, history)
 
     if error or not ai_params:
@@ -105,7 +108,6 @@ async def receive_prompt(message: Message, state: FSMContext, bot: Bot):
             _cancel_keyboard())
         return
 
-    # Обновляем историю для следующей итерации
     history.append({"role": "user",  "text": prompt})
     history.append({"role": "model", "text": json.dumps(ai_params, ensure_ascii=False)})
 
@@ -129,7 +131,6 @@ async def _show_ai_preview(
     explanation = ai_params.get("explanation", "")
     suggestions = ai_params.get("suggestions", "")
 
-    # Красивый список выбранных компонентов
     fields = [
         ("⚔️ Оружие",    ai_params.get("weapons")),
         ("🛡️ Броня",     ai_params.get("armor")),
@@ -146,14 +147,6 @@ async def _show_ai_preview(
     if color_hex and color_hex.lower() not in ("null", "none", ""):
         fields.append(("🎨 Цвет тинта", f"#{color_hex}"))
 
-    components = "\n".join(
-        f"  {emoji} <b>{name}:</b> {_LABEL_MAP.get(key, key)}"
-        for emoji_name, key in [(f[0], f[1]) for f in fields]
-        for name, emoji in [(" ".join(emoji_name.split()[1:]), emoji_name.split()[0])]
-        if key
-    )
-
-    # Переформатируем для читаемости
     lines = []
     for label, key in fields:
         if key:
@@ -205,16 +198,13 @@ async def ai_build(call: CallbackQuery, state: FSMContext, bot: Bot):
         "⏳ Это займёт 10–30 секунд...",
     )
 
-    # Конвертируем params Gemini → params для RPBuilder
     rp_params = gemini_params_to_rp_params(ai_params, version)
 
-    # Лейблы для caption
     rp_params["weapons_label"]    = _LABEL_MAP.get(rp_params["weapons"], "—")
     rp_params["armor_label"]      = _LABEL_MAP.get(rp_params["armor"], "—")
     rp_params["sky_label"]        = _LABEL_MAP.get(rp_params["sky"], "—")
     rp_params["gui_label"]        = _LABEL_MAP.get(rp_params["gui"], "—")
 
-    # Собираем с прогресс-колбэком
     last_progress_text = {"v": ""}
     async def progress_cb(text: str):
         if text == last_progress_text["v"]:
@@ -242,37 +232,27 @@ async def ai_build(call: CallbackQuery, state: FSMContext, bot: Bot):
     theme = rp_params.get("detected_theme", "AI")
     rp_filename = f"AI_{theme}_{version}_by_unkony.zip"
 
+    # ── ИСПРАВЛЕНО: цикл retry отвечает ТОЛЬКО за отправку файла.
+    # deduct_generation() и логирование вынесены за пределы цикла —
+    # они выполняются один раз, только при подтверждённом успехе.
     sent = False
-    sent_file_id = None
+    sent_msg = None
+    last_send_error = None
+
     for attempt in range(3):
         try:
             doc = FSInputFile(zip_path, filename=rp_filename)
-            ud = await get_user(user_id)
-            ai_gens_left = (ud["ai_generations"] if ud else 0) - 1
-
-            explanation_short = (ai_params.get("explanation", "") or "")[:200]
-
             sent_msg = await bot.send_document(
                 chat_id=call.message.chat.id,
                 document=doc,
-                caption=(
-                    f"🤖 <b>ИИ-ресурспак готов!</b>\n\n"
-                    f"🎮 Версия: <b>{version}</b>\n"
-                    f"⚔️ {rp_params['weapons_label']} · 🛡️ {rp_params['armor_label']}\n"
-                    f"🌌 {rp_params['sky_label']} · 📦 {rp_params['gui_label']}\n\n"
-                    + (f"💬 <i>{explanation_short}</i>\n\n" if explanation_short else "")
-                    + f"🤖 Осталось ИИ-генераций: <b>{ai_gens_left}</b>\n\n"
-                    "📂 <code>.minecraft/resourcepacks/</code>"
-                ),
+                caption="⏳ Финализирую...",  # временная подпись, обновим после
                 parse_mode="HTML",
                 request_timeout=120,
             )
-            sent_file_id = sent_msg.document.file_id if sent_msg.document else None
-            await deduct_generation(user_id, ai=True)
-            await _log_ai_generation(user_id, version, rp_params, ai_params.get("explanation",""))
             sent = True
             break
         except Exception as e:
+            last_send_error = e
             logger.warning(f"Send attempt {attempt+1}/3: {e}")
             if attempt < 2:
                 await asyncio.sleep(5)
@@ -281,15 +261,53 @@ async def ai_build(call: CallbackQuery, state: FSMContext, bot: Bot):
     builder.cleanup_zip()
 
     if not sent:
+        logger.error(f"AI RP send failed after 3 attempts: {last_send_error}")
         await send_clean(bot, call.message.chat.id,
             "❌ Не удалось отправить файл.\n"
             "ИИ-генерация не списана. Обратись: @testpythonunkony_bot")
         await state.clear()
         return
 
+    # ── Отправка точно прошла успешно — теперь и только теперь
+    # списываем генерацию, логируем и обновляем подпись с актуальным балансом.
+    sent_file_id = sent_msg.document.file_id if sent_msg.document else None
+
+    try:
+        await deduct_generation(user_id, ai=True)
+    except Exception as e:
+        logger.error(f"deduct_generation failed after successful send: {e}")
+        # Файл уже отправлен, генерация может не списаться — логируем, но не повторяем отправку
+
+    try:
+        await _log_ai_generation(user_id, version, rp_params, ai_params.get("explanation", ""))
+    except Exception as e:
+        logger.error(f"_log_ai_generation failed: {e}")
+
+    ud = await get_user(user_id)
+    ai_gens_left = ud["ai_generations"] if ud else 0
+    explanation_short = (ai_params.get("explanation", "") or "")[:200]
+
+    # Обновляем подпись отправленного документа финальным текстом
+    try:
+        await bot.edit_message_caption(
+            chat_id=call.message.chat.id,
+            message_id=sent_msg.message_id,
+            caption=(
+                f"🤖 <b>ИИ-ресурспак готов!</b>\n\n"
+                f"🎮 Версия: <b>{version}</b>\n"
+                f"⚔️ {rp_params['weapons_label']} · 🛡️ {rp_params['armor_label']}\n"
+                f"🌌 {rp_params['sky_label']} · 📦 {rp_params['gui_label']}\n\n"
+                + (f"💬 <i>{explanation_short}</i>\n\n" if explanation_short else "")
+                + f"🤖 Осталось ИИ-генераций: <b>{ai_gens_left}</b>\n\n"
+                "📂 <code>.minecraft/resourcepacks/</code>"
+            ),
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        logger.warning(f"Failed to update caption: {e}")
+
     if sent_file_id:
-        import time as _time
-        rp_id = f"{user_id}_ai_{int(_time.time())}"
+        rp_id = f"{user_id}_ai_{int(time.time())}"
         await state.update_data(
             publish_file_id=sent_file_id,
             publish_rp_id=rp_id,
@@ -335,12 +353,10 @@ async def ai_refine(call: CallbackQuery, state: FSMContext, bot: Bot):
         '• "Всё хорошо, но оружие сделай ярче"</i>',
         _cancel_keyboard(),
     )
-    # Остаёмся в AIRP.prompt — следующий message придёт как уточнение с историей
 
 
 @router.callback_query(AIRP.prompt, F.data == "ai_regenerate")
 async def ai_regenerate(call: CallbackQuery, state: FSMContext, bot: Bot):
-    """Перегенерировать с тем же промптом, но без истории → свежий взгляд."""
     await call.answer()
     data = await state.get_data()
     last_prompt = data.get("last_prompt", "")
@@ -349,7 +365,6 @@ async def ai_regenerate(call: CallbackQuery, state: FSMContext, bot: Bot):
         await call.answer("⚠️ Промпт не сохранён", show_alert=True)
         return
 
-    # Сбрасываем историю но сохраняем промпт
     await state.update_data(history=[], iteration=0)
 
     await edit_clean(
@@ -428,11 +443,11 @@ async def _delete_thinking(bot: Bot, chat_id: int, msg):
 async def _log_ai_generation(
     user_id: int, version: str, rp_params: dict, explanation: str
 ):
-    import aiosqlite
+    from bot.database.models import _DB
     safe = {k: v for k, v in rp_params.items()
             if isinstance(v, (str, int, float, bool, type(None)))}
     safe["ai_explanation"] = explanation[:200] if explanation else ""
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with _DB() as db:
         await db.execute(
             "INSERT INTO generations (user_id, mode, version, params, status) VALUES (?,?,?,?,?)",
             (user_id, "ai", version, json.dumps(safe, ensure_ascii=False), "done")

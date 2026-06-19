@@ -1,18 +1,5 @@
 """
-Полноценная админ-панель (только для ADMIN_ID / owner).
-
-Возможности:
-  /admin                — главная панель
-  /addgens <id> <n>     — выдать обычные генерации
-  /addai <id> <n>       — выдать ИИ-генерации
-  /ban <id>             — забанить пользователя
-  /unban <id>           — разбанить
-  /broadcast <текст>    — рассылка всем пользователям
-  /users                — список последних пользователей (real-time)
-  /payments             — сводка по платежам
-  /gemini               — проверить статус Gemini API
-
-Все функции работают с PostgreSQL и SQLite через универсальный _DB из models.py.
+Патч для admin.py — исправлен /gemini (ValidationError в edit_message_text).
 """
 from __future__ import annotations
 
@@ -61,7 +48,7 @@ async def cmd_admin(message: Message, bot: Bot):
     await _try_delete(message)
     if not is_owner(message.from_user.id):
         return
-    stats = await get_stats()
+    stats   = await get_stats()
     gstatus = await _check_gemini_quick()
     text = (
         "🛠 <b>Панель администратора</b>\n\n"
@@ -104,7 +91,7 @@ async def adm_main(call: CallbackQuery):
     if not is_owner(call.from_user.id):
         await call.answer("Нет доступа", show_alert=True); return
     await call.answer()
-    stats = await get_stats()
+    stats   = await get_stats()
     gstatus = await _check_gemini_quick()
     text = (
         "🛠 <b>Панель администратора</b>\n\n"
@@ -154,7 +141,6 @@ async def adm_users_cb(call: CallbackQuery):
             f"  {_fmt_dt(u.get('created_at'))}"
         )
     text = "\n".join(lines)
-    # Telegram лимит 4096 символов
     if len(text) > 4000:
         text = text[:4000] + "\n..."
     await call.message.edit_text(text, parse_mode="HTML", reply_markup=_back_kb())
@@ -384,15 +370,22 @@ async def cmd_payments(message: Message, bot: Bot):
     await bot.send_message(message.chat.id, text, parse_mode="HTML")
 
 
-# ── /gemini ───────────────────────────────────────────────
+# ── /gemini — ИСПРАВЛЕНО ──────────────────────────────────
+# Старый код: bot.edit_message_text(result, chat_id, msg_id)
+# aiogram 3.x: позиционные аргументы (text, chat_id, msg_id) не работают —
+# chat_id попадает в business_connection_id (строка, а не int → ValidationError).
+# Правильно: использовать m.edit_text() напрямую.
 
 @router.message(Command("gemini"))
 async def cmd_gemini(message: Message, bot: Bot):
     await _try_delete(message)
     if not is_owner(message.from_user.id): return
+    # Отправляем сообщение-заглушку и редактируем его результатом
     m = await bot.send_message(message.chat.id, "🤖 Проверяю Gemini API...")
     result = await _check_gemini_full()
-    await bot.edit_message_text(result, message.chat.id, m.message_id, parse_mode="HTML")
+    # Используем метод объекта Message, а не bot.edit_message_text —
+    # это исключает путаницу с позиционными аргументами
+    await m.edit_text(result, parse_mode="HTML")
 
 
 # ── /cancel ───────────────────────────────────────────────
@@ -405,7 +398,7 @@ async def cmd_cancel(message: Message, state: FSMContext, bot: Bot):
         await bot.send_message(message.chat.id, "❌ Отменено.")
 
 
-# ── DB-хелперы (используют _DB — работают с PG и SQLite) ─
+# ── DB-хелперы ────────────────────────────────────────────
 
 async def _get_recent_users(limit: int) -> list[dict]:
     async with _DB() as db:
@@ -433,7 +426,6 @@ async def _count_users() -> int:
 
 async def _get_extra_stats() -> dict:
     async with _DB() as db:
-        # Совместимый SQL для PG и SQLite
         if _DB._USE_PG_FLAG():
             new_24h = await db.fetchval(
                 "SELECT COUNT(*) FROM users WHERE created_at >= NOW() - INTERVAL '1 day'"
@@ -442,13 +434,13 @@ async def _get_extra_stats() -> dict:
             new_24h = await db.fetchval(
                 "SELECT COUNT(*) FROM users WHERE created_at >= datetime('now', '-1 day')"
             ) or 0
-        banned     = await db.fetchval("SELECT COUNT(*) FROM users WHERE is_banned = 1") or 0
+        banned     = await db.fetchval(
+            "SELECT COUNT(*) FROM users WHERE is_banned = 1") or 0
         ai_done    = await db.fetchval(
             "SELECT COUNT(*) FROM generations WHERE mode = 'ai' AND status = 'done'"
         ) or 0
         pending    = await db.fetchval(
-            "SELECT COUNT(*) FROM payments WHERE status = 'pending'"
-        ) or 0
+            "SELECT COUNT(*) FROM payments WHERE status = 'pending'") or 0
         total_paid = await db.fetchval(
             "SELECT COALESCE(SUM(amount), 0) FROM payments WHERE status = 'paid'"
         ) or 0
@@ -516,18 +508,22 @@ async def _check_gemini_full() -> str:
         "contents": [{"role": "user", "parts": [{"text": "Reply: OK"}]}],
         "generationConfig": {"maxOutputTokens": 5},
     }
-    lines   = ["🤖 <b>Статус Gemini API</b>\n"]
-    any_ok  = False
+    lines  = ["🤖 <b>Статус Gemini API</b>\n"]
+    any_ok = False
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=12)) as s:
         for model in MODELS:
-            url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
-                   f"{model}:generateContent?key={GEMINI_API_KEY}")
+            url = (
+                f"https://generativelanguage.googleapis.com/v1beta/models/"
+                f"{model}:generateContent?key={GEMINI_API_KEY}"
+            )
             try:
                 async with s.post(url, json=PAYLOAD) as r:
                     if r.status == 200:
-                        lines.append(f"✅ <code>{model}</code> — работает"); any_ok = True
+                        lines.append(f"✅ <code>{model}</code> — работает")
+                        any_ok = True
                     elif r.status == 429:
-                        lines.append(f"⏳ <code>{model}</code> — квота (429)"); any_ok = True
+                        lines.append(f"⏳ <code>{model}</code> — квота (429)")
+                        any_ok = True
                     elif r.status == 403:
                         lines.append(f"🔑 <code>{model}</code> — нет доступа (403)")
                     elif r.status == 404:
