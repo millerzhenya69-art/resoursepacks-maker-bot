@@ -1,6 +1,9 @@
 """
 Полный 11-шаговый FSM диалог шаблонного режима.
 Шаги: оружие→броня→инструменты→еда/зелья→небо→GUI→звуки→цвет→меню→партикли→пожелание
+
+ИСПРАВЛЕНО: _log_generation переведён с aiosqlite на универсальный _DB
+(работает с PostgreSQL на Render и SQLite локально).
 """
 from __future__ import annotations
 import asyncio
@@ -12,7 +15,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message, FSInputFile
 
 from bot.database import get_user, deduct_generation
-from bot.database.models import DB_PATH
+from bot.database.models import _DB
 from bot.handlers.states import TemplateRP
 from bot.keyboards_rp import (
     weapons_keyboard, armor_keyboard, tools_keyboard, consumables_keyboard,
@@ -465,7 +468,6 @@ async def rp_build(call: CallbackQuery, state: FSMContext, bot: Bot):
     builder.cleanup_zip()
 
     if sent and sent_file_id:
-        # Спрашиваем об публикации в форум
         import time as _time
         rp_id = f"{user_id}_{int(_time.time())}"
         await state.update_data(
@@ -486,7 +488,6 @@ async def rp_build(call: CallbackQuery, state: FSMContext, bot: Bot):
             "📢 <b>Опубликовать данный РП</b> в <a href=\"https://t.me/forum_of_resoursepack_maker\">t.me/forum_of_resoursepack_maker</a>?",
             publish_rp_keyboard(rp_id),
         )
-        # Не очищаем state — ждём ответа на публикацию
         return
 
     await state.clear()
@@ -567,12 +568,11 @@ async def step_skip(call: CallbackQuery, state: FSMContext, bot: Bot):
         await _show_confirm(bot, call.message.chat.id, state)
 
 
-# ── Сохранение в БД ──────────────────────────────────────
+# ── Сохранение в БД (ИСПРАВЛЕНО — использует _DB вместо aiosqlite) ───
 
 async def _log_generation(user_id: int, mode: str, params: dict):
-    import aiosqlite
     safe = {k: v for k, v in params.items() if isinstance(v, (str, int, float, bool, type(None)))}
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with _DB() as db:
         await db.execute(
             "INSERT INTO generations (user_id, mode, version, params, status) VALUES (?,?,?,?,?)",
             (user_id, mode, params.get("version","?"), json.dumps(safe), "done")

@@ -13,6 +13,9 @@
 
 На каждом шаге пользователь может пропустить («⏩ Пропустить»).
 Загрузка строго классифицируется по текущему шагу — никакой путаницы.
+
+ИСПРАВЛЕНО: _log_custom переведён с aiosqlite на универсальный _DB
+(работает с PostgreSQL на Render и SQLite локально).
 """
 from __future__ import annotations
 
@@ -35,7 +38,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from bot.config import TEMP_DIR, PACKS_DIR
 from bot.database import get_user, deduct_generation
-from bot.database.models import DB_PATH
+from bot.database.models import _DB
 from bot.handlers.states import CustomRP
 from bot.services.message_manager import send_clean, edit_clean, delete_user_message
 from bot.services.rp_catalog import PACK_FORMATS
@@ -146,7 +149,7 @@ STEPS = [
             "• Квадратное соотношение сторон\n\n"
             "Если не загрузишь — будет использована стандартная иконка бота"
         ),
-        "dest_path": None,  # особый шаг — пишем прямо в корень
+        "dest_path": None,
         "allowed":   [".png", ".jpg", ".jpeg"],
     },
 ]
@@ -161,7 +164,7 @@ async def start_custom_dialog(call: CallbackQuery, state: FSMContext, bot: Bot, 
     await state.update_data(
         version=version,
         step=0,
-        uploads={},        # {step_key: [{"name":…, "path":…, "ext":…}]}
+        uploads={},
         work_dir=None,
     )
     await edit_clean(
@@ -224,7 +227,6 @@ async def receive_file(message: Message, state: FSMContext, bot: Bot):
     dest = os.path.join(tmp_dir, fname)
 
     try:
-        # bot.download() работает для файлов любого размера (в отличие от get_file+download_file)
         await bot.download(doc, destination=dest)
     except Exception as e:
         logger.error(f"Download failed: {e}")
@@ -262,7 +264,6 @@ async def next_step(call: CallbackQuery, state: FSMContext, bot: Bot):
     next_idx = step_idx + 1
 
     if next_idx >= len(STEPS):
-        # Все шаги пройдены — показываем итог
         await _show_summary(call, state, bot)
         return
 
@@ -466,7 +467,6 @@ async def _build_custom_rp(user_id: int, version: str, uploads: dict) -> Optiona
     try:
         os.makedirs(work_dir, exist_ok=True)
 
-        # Базовый пак
         base_zip = os.path.join(PACKS_DIR, f"base_{version}.zip")
         if os.path.exists(base_zip):
             with zipfile.ZipFile(base_zip, "r") as zf:
@@ -482,29 +482,25 @@ async def _build_custom_rp(user_id: int, version: str, uploads: dict) -> Optiona
                     with zf.open(member) as src, open(dest_path, "wb") as dst:
                         dst.write(src.read())
 
-        # Встраиваем файлы пользователя по шагам
         for step in STEPS:
             step_files = uploads.get(step["key"], [])
             for f in step_files:
                 _embed_file(f, step, work_dir)
 
-        # Equipment JSON для брони (1.21.2+)
         _inject_equipment_json(work_dir)
 
-        # pack.mcmeta
         fmt = PACK_FORMATS.get(version, {"pack_format": 46})
         pack_format = fmt["pack_format"]
         mcmeta = {
             "pack": {
                 "pack_format": pack_format,
-                "supported_formats": [34, 999],  # широкий диапазон — совместим со всеми 1.21.x
+                "supported_formats": [34, 999],
                 "description": f"Custom RP {version} by unkony",
             }
         }
         with open(os.path.join(work_dir, "pack.mcmeta"), "w", encoding="utf-8") as mf:
             json.dump(mcmeta, mf, indent=2, ensure_ascii=False)
 
-        # Упаковка
         with zipfile.ZipFile(out_zip, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
             for root, _, files in os.walk(work_dir):
                 for file in files:
@@ -544,7 +540,6 @@ def _embed_file(f: dict, step: dict, work_dir: str):
     elif ext in (".png", ".jpg", ".jpeg"):
         basename = os.path.splitext(name)[0] + ".png"
 
-        # Особый шаг — иконка пака
         if step["key"] == "icon":
             try:
                 from PIL import Image
@@ -570,14 +565,13 @@ def _embed_file(f: dict, step: dict, work_dir: str):
                 shutil.copy2(path, dest_file)
 
     elif ext == ".ogg":
-        # OGG → определяем куда класть по имени файла
         lname = name.lower()
         if any(k in lname for k in ("attack", "hit", "crit", "strong", "weak", "sweep", "knock")):
             sub = "entity/player/attack"
         elif any(k in lname for k in ("hurt", "damage", "pain")):
             sub = "entity/player/hurt"
         else:
-            sub = "entity/player/attack"  # дефолт
+            sub = "entity/player/attack"
 
         dest_dir = os.path.join(work_dir, "assets", "minecraft", "sounds", sub)
         os.makedirs(dest_dir, exist_ok=True)
@@ -653,11 +647,10 @@ def _summary_keyboard():
     return builder.as_markup()
 
 
-# ── Логирование ───────────────────────────────────────────
+# ── Логирование (ИСПРАВЛЕНО — использует _DB вместо aiosqlite) ───
 
 async def _log_custom(user_id: int, version: str, file_count: int):
-    import aiosqlite
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with _DB() as db:
         await db.execute(
             "INSERT INTO generations (user_id, mode, version, params, status) VALUES (?,?,?,?,?)",
             (user_id, "custom", version,

@@ -1,5 +1,12 @@
 """
 Система оплаты: Telegram Stars, CryptoBot, DonatePay (polling).
+
+ИСПРАВЛЕНО: все функции работы с БД переведены с aiosqlite (только SQLite)
+на универсальный _DB из bot.database.models (работает с PostgreSQL и SQLite).
+Старый код напрямую открывал aiosqlite.connect(DB_PATH), что на Render
+(где используется PostgreSQL через DATABASE_URL) приводило к ошибке
+"no such table: payments" — физически создавался отдельный пустой
+SQLite-файл вместо использования реальной Postgres БД.
 """
 from __future__ import annotations
 import asyncio
@@ -17,7 +24,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from bot.config import CRYPTOBOT_TOKEN, DONATEPAY_API_KEY, TARIFFS, RUBLES_PER_GEN
 from bot.database import add_generations, get_user
-from bot.database.models import DB_PATH
+from bot.database.models import _DB
 from bot.keyboards import back_keyboard, main_menu_keyboard
 from bot.services.message_manager import edit_clean
 
@@ -36,12 +43,11 @@ def _tariff_info(tariff_key: str) -> dict | None:
 async def _save_payment(user_id: int, method: str, tariff_key: str,
                          amount: float, stars: int, gens: int,
                          status: str, payload: str = "") -> None:
-    import aiosqlite
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with _DB() as db:
         await db.execute(
-            """INSERT INTO payments
-               (user_id, method, tariff, amount, stars, gens_added, status, payload)
-               VALUES (?,?,?,?,?,?,?,?)""",
+            "INSERT INTO payments "
+            "(user_id, method, tariff, amount, stars, gens_added, status, payload) "
+            "VALUES (?,?,?,?,?,?,?,?)",
             (user_id, method, tariff_key, amount, stars, gens, status, payload)
         )
         await db.commit()
@@ -102,12 +108,11 @@ async def stars_payment_success(message: Message, bot: Bot):
     if not payload.startswith("stars_"):
         return
 
-    rest = payload[len("stars_"):]  # всё после "stars_"
+    rest = payload[len("stars_"):]
 
     # ── Кастомный пакет: stars_custom_<amount>_<user_id> ──
     if rest.startswith("custom_"):
-        # stars_custom_<amount>_<user_id>
-        inner = rest[len("custom_"):]       # "<amount>_<user_id>"
+        inner = rest[len("custom_"):]
         sep = inner.rfind("_")
         if sep < 0:
             return
@@ -124,7 +129,6 @@ async def stars_payment_success(message: Message, bot: Bot):
         return
 
     # ── Обычный тариф: stars_<tariff_key>_<user_id> ───────
-    # tariff_key может содержать "_" (ai_pack) — парсим с конца
     last_sep = rest.rfind("_")
     if last_sep < 0:
         return
@@ -219,13 +223,11 @@ async def pay_crypto_invoice(call: CallbackQuery, bot: Bot):
         builder.as_markup())
 
 
-
 # ── Кастомный пакет через CryptoBot ──────────────────────────────────────────
 
 @router.callback_query(F.data.startswith("pay_crypto_custom_"))
 async def pay_crypto_custom(call: CallbackQuery, bot: Bot):
     await call.answer()
-    # pay_crypto_custom_<amount>
     rest = call.data[len("pay_crypto_custom_"):]
     try:
         amount = int(rest)
@@ -328,7 +330,6 @@ async def pay_donate_custom(call: CallbackQuery, bot: Bot):
 @router.callback_query(F.data.startswith("ccheck_"))
 async def crypto_check_payment(call: CallbackQuery, bot: Bot):
     await call.answer("Проверяю...", show_alert=False)
-    # ccheck_<invoice_id>_<tariff>_<uid>
     parts = call.data.split("_", 4)
     if len(parts) < 5:
         return
@@ -346,8 +347,7 @@ async def crypto_check_payment(call: CallbackQuery, bot: Bot):
     if status == "paid":
         t  = _tariff_info(tariff_key)
         ai = tariff_key == "ai_pack"
-        import aiosqlite
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with _DB() as db:
             await db.execute(
                 "UPDATE payments SET status='paid' WHERE payload=? AND user_id=?",
                 (invoice_id, user_id)
@@ -362,8 +362,6 @@ async def crypto_check_payment(call: CallbackQuery, bot: Bot):
 
 
 # ── 💳 DONATEPAY (polling) ───────────────────────────────────────────────────
-# DonatePay использует Centrifugo WebSocket, а не HTTP webhook.
-# Мы используем polling: при нажатии «Я оплатил» проверяем /transactions.
 
 DONATEPAY_API = "https://donatepay.ru/api/v1"
 
@@ -403,13 +401,11 @@ async def pay_donatepay(call: CallbackQuery, bot: Bot):
     gen_word = "ИИ-генераций" if ai else "генераций"
     user_id = call.from_user.id
 
-    # Сохраняем pending с timestamp — по нему найдём транзакцию
     ts = int(time.time())
     payload_str = f"dp_{tariff_key}_{user_id}_{ts}"
     await _save_payment(user_id, "donatepay", tariff_key,
                         t["rub"], 0, t["gens"], "pending", payload_str)
 
-    # Ссылка на донат с комментарием = payload (чтобы найти транзакцию)
     donate_url = f"https://donatepay.ru/don/{await _get_donatepay_user_id()}"
 
     builder = InlineKeyboardBuilder()
@@ -435,7 +431,6 @@ async def pay_donatepay(call: CallbackQuery, bot: Bot):
 @router.callback_query(F.data.startswith("dpcheck_"))
 async def donatepay_check(call: CallbackQuery, bot: Bot):
     await call.answer("Проверяю...", show_alert=False)
-    # Формат: dpcheck_<uid>_<ts>_<tariff_key>  (tariff последний — может быть custom_15)
     rest = call.data[len("dpcheck_"):]
     first_sep  = rest.find("_")
     second_sep = rest.find("_", first_sep+1)
@@ -443,9 +438,8 @@ async def donatepay_check(call: CallbackQuery, bot: Bot):
         return
     user_id    = int(rest[:first_sep])
     ts         = int(rest[first_sep+1:second_sep])
-    tariff_key = rest[second_sep+1:]   # "pro" или "custom_15"
+    tariff_key = rest[second_sep+1:]
 
-    # Кастомный пакет
     custom_amount = None
     if tariff_key.startswith("custom_"):
         try:
@@ -455,7 +449,6 @@ async def donatepay_check(call: CallbackQuery, bot: Bot):
 
     payload_str = f"dp_{tariff_key}_{user_id}_{ts}"
 
-    # Проверяем последние транзакции DonatePay
     result = await _donatepay_get("/transactions")
     if not result:
         await call.answer("Не удалось проверить. Попробуй позже.", show_alert=True)
@@ -479,17 +472,11 @@ async def donatepay_check(call: CallbackQuery, bot: Bot):
                     break
 
     if found:
-        t  = _tariff_info(tariff_key)
-        ai = tariff_key == "ai_pack"
-
-        import aiosqlite
-        async with aiosqlite.connect(DB_PATH) as db:
-            # Проверяем что не дублируем
-            r = await db.execute(
-                "SELECT status FROM payments WHERE payload=?", (payload_str,)
+        async with _DB() as db:
+            row = await db.fetchone(
+                "SELECT status FROM payments WHERE payload = ?", (payload_str,)
             )
-            row = await r.fetchone()
-            if row and row[0] == "paid":
+            if row and row.get("status") == "paid":
                 await call.answer("Уже начислено!", show_alert=True)
                 return
             await db.execute(

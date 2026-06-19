@@ -6,6 +6,11 @@
 - Бот (@Elyon_by_unkony_bot) — проверяем через БД (факт запуска /start у того бота)
   Пометку ставит сам @Elyon_by_unkony_bot при старте, либо мы принимаем
   на веру после нажатия кнопки (честная система — Telegram не даёт другого способа).
+
+ИСПРАВЛЕНО: mark_bot_started / _check_bot_started переведены с прямого
+aiosqlite.connect() на универсальный _DB (PostgreSQL + SQLite совместимость).
+Также таблица bot_starts теперь создаётся через CREATE TABLE с правильным
+синтаксисом для обоих бэкендов вместо SQLite-only executescript.
 """
 from __future__ import annotations
 
@@ -13,9 +18,38 @@ from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest
 
 from bot.config import REQUIRED_CHANNELS
+from bot.database.models import _DB
 
 # username ботов (не каналов) — для них get_chat_member не работает
 BOT_USERNAMES: set[str] = {"Elyon_by_unkony_bot"}
+
+_table_ready = False
+
+
+async def _ensure_bot_starts_table():
+    """Создаёт таблицу bot_starts один раз при первом обращении."""
+    global _table_ready
+    if _table_ready:
+        return
+    async with _DB() as db:
+        if _DB._USE_PG_FLAG():
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS bot_starts (
+                    user_id      BIGINT NOT NULL,
+                    bot_username TEXT   NOT NULL,
+                    PRIMARY KEY (user_id, bot_username)
+                )
+            """)
+        else:
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS bot_starts (
+                    user_id      INTEGER NOT NULL,
+                    bot_username TEXT    NOT NULL,
+                    PRIMARY KEY (user_id, bot_username)
+                )
+            """)
+        await db.commit()
+    _table_ready = True
 
 
 async def check_subscriptions(bot: Bot, user_id: int) -> list[dict]:
@@ -28,12 +62,10 @@ async def check_subscriptions(bot: Bot, user_id: int) -> list[dict]:
         username = channel["username"]
 
         if username in BOT_USERNAMES:
-            # Для ботов — проверяем флаг в нашей БД
             started = await _check_bot_started(user_id, username)
             if not started:
                 not_subscribed.append(channel)
         else:
-            # Для каналов — стандартная проверка
             subscribed = await _is_channel_member(bot, user_id, username)
             if not subscribed:
                 not_subscribed.append(channel)
@@ -46,20 +78,20 @@ async def mark_bot_started(user_id: int, bot_username: str) -> None:
     Вызывается когда пользователь нажимает кнопку 'Я подписался'.
     Помечаем что он запустил бота (доверяем на слово — иначе никак).
     """
-    import aiosqlite
-    from bot.database.models import DB_PATH
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS bot_starts (
-                user_id      INTEGER NOT NULL,
-                bot_username TEXT    NOT NULL,
-                PRIMARY KEY (user_id, bot_username)
+    await _ensure_bot_starts_table()
+    async with _DB() as db:
+        # INSERT OR IGNORE — SQLite-синтаксис; для PG нужен ON CONFLICT DO NOTHING
+        if _DB._USE_PG_FLAG():
+            await db.execute(
+                "INSERT INTO bot_starts (user_id, bot_username) VALUES (?, ?) "
+                "ON CONFLICT (user_id, bot_username) DO NOTHING",
+                (user_id, bot_username)
             )
-        """)
-        await db.execute(
-            "INSERT OR IGNORE INTO bot_starts (user_id, bot_username) VALUES (?, ?)",
-            (user_id, bot_username)
-        )
+        else:
+            await db.execute(
+                "INSERT OR IGNORE INTO bot_starts (user_id, bot_username) VALUES (?, ?)",
+                (user_id, bot_username)
+            )
         await db.commit()
 
 
@@ -71,15 +103,14 @@ async def mark_all_bots_started(user_id: int) -> None:
 
 async def _check_bot_started(user_id: int, bot_username: str) -> bool:
     """Проверяет флаг в БД."""
-    import aiosqlite
-    from bot.database.models import DB_PATH
     try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            r = await db.execute(
+        await _ensure_bot_starts_table()
+        async with _DB() as db:
+            row = await db.fetchone(
                 "SELECT 1 FROM bot_starts WHERE user_id = ? AND bot_username = ?",
                 (user_id, bot_username)
             )
-            return await r.fetchone() is not None
+            return row is not None
     except Exception:
         return False
 
@@ -93,7 +124,6 @@ async def _is_channel_member(bot: Bot, user_id: int, channel_username: str) -> b
         return member.status not in ("left", "kicked", "banned")
     except TelegramBadRequest as e:
         err = str(e).lower()
-        # Канал не найден или бот не в канале — пропускаем проверку
         if "chat not found" in err or "bot is not a member" in err or "user not found" in err:
             return True
         return False
